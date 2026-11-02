@@ -226,7 +226,7 @@ for symbol in st.session_state.tickers:
         if price is not None:
             delta = change_label(amount, percentage)
             st.metric("Latest price", f"${price:,.2f}", delta=delta if amount is not None else None)
-            st.line_chart(prices, height=115, use_container_width=True, x_axis=None, y_axis=None)
+            st.line_chart(prices)
 
 if not st.session_state.tickers:
     st.info("No stocks in your watchlist. Add a ticker above.")
