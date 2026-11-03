@@ -297,14 +297,40 @@ with st.form("add_ticker", clear_on_submit=True):
             except Exception as exc:
                 st.error(f"Could not add {symbol}: {exc}")
 
+range_col, sort_col = st.columns(2)
+with range_col:
+    chart_range = st.selectbox("Chart range", ["1M", "6M", "1Y"], index=0)
+with sort_col:
+    sort_choice = st.selectbox("Sort by", ["Default order", "Biggest drop first", "Biggest gain first", "A to Z"])
+
+# Only fetch each quote once before rendering, including for sorted views.
+quotes = {}
 for symbol in st.session_state.tickers:
+    try:
+        quotes[symbol] = (stock_data(symbol), None)
+    except Exception as exc:
+        quotes[symbol] = (None, str(exc))
+
+ordered = list(st.session_state.tickers)
+if sort_choice == "A to Z":
+    ordered.sort()
+elif sort_choice in ("Biggest drop first", "Biggest gain first"):
+    reverse_change = sort_choice == "Biggest gain first"
+    def sort_key(symbol):
+        quote = quotes[symbol][0]
+        change = quote[3] if quote is not None else None
+        return (change is None, (-change if reverse_change else change) if change is not None else 0)
+    ordered.sort(key=sort_key)
+
+for symbol in ordered:
     with st.container(border=True):
         left, right = st.columns([4, 1], vertical_alignment="top")
-        try:
-            name, price, amount, percentage, prices = stock_data(symbol)
-        except Exception as exc:
+        quote, error = quotes[symbol]
+        if quote is not None:
+            name, price, amount, percentage, prices = quote
+        else:
             name, price, amount, percentage, prices = symbol, None, None, None, None
-            st.caption(f"{symbol}: price temporarily unavailable ({exc})")
+            st.caption(f"{symbol}: price temporarily unavailable ({error})")
         with left:
             st.markdown(f"**{symbol}** · {name}")
         with right:
@@ -319,7 +345,48 @@ for symbol in st.session_state.tickers:
         if price is not None:
             delta = change_label(amount, percentage)
             st.metric("Latest price", f"${price:,.2f}", delta=delta if amount is not None else None)
-            st.line_chart(prices)
+            info = cached_info(symbol)
+            high = numeric(info.get("fiftyTwoWeekHigh"))
+            low = numeric(info.get("fiftyTwoWeekLow"))
+            yearly = cached_history(symbol, period="1y")
+            if high is None and "High" in yearly:
+                high = numeric(yearly["High"].max())
+            if low is None and "Low" in yearly:
+                low = numeric(yearly["Low"].min())
+            down_high = 100 * (price / high - 1) if high and high > 0 else None
+
+            fundamentals_left, fundamentals_right = st.columns(2)
+            with fundamentals_left:
+                st.caption(f"52W high: **{formatted(high, 'money')}**")
+                st.caption(f"52W low: **{formatted(low, 'money')}**")
+                st.caption(f"From 52W high: **{formatted(down_high, 'percent')}**")
+            with fundamentals_right:
+                st.caption(f"Market cap: **{formatted(info.get('marketCap'), 'cap')}**")
+                st.caption(f"Trailing P/E: **{formatted(info.get('trailingPE'))}**")
+
+            avg50 = numeric(prices.tail(50).mean()) if len(prices) >= 50 else None
+            avg200 = numeric(prices.tail(200).mean()) if len(prices) >= 200 else None
+            signals = [f"RSI(14): {formatted(rsi14(prices))}"]
+            signals.append(("Above 50d" if price >= avg50 else "Below 50d") if avg50 is not None else "50d —")
+            signals.append(("Above 200d" if price >= avg200 else "Below 200d") if avg200 is not None else "200d —")
+            flags = []
+            if percentage is not None and abs(percentage) >= 5:
+                flags.append("⚠ Daily move ≥5%")
+            if low and low > 0 and abs(price - low) / low <= 0.05:
+                flags.append("Near 52W low")
+            if high and high > 0 and abs(price - high) / high <= 0.05:
+                flags.append("Near 52W high")
+            st.caption(" · ".join(signals))
+            if flags:
+                st.caption(" · ".join(flags))
+
+            st.line_chart(range_history(prices, chart_range))
+            headlines = news_items(symbol)
+            if headlines:
+                with st.expander("Latest headlines"):
+                    for title, publisher, url in headlines:
+                        st.markdown(f"[{title}]({url})")
+                        st.caption(publisher)
 
 if not st.session_state.tickers:
     st.info("No stocks in your watchlist. Add a ticker above.")
