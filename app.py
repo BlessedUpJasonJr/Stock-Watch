@@ -2,12 +2,14 @@
 
 import base64
 import json
+import math
 import re
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+import pandas as pd
 import streamlit as st
 import yfinance as yf
 
@@ -109,17 +111,105 @@ def save_github(tickers, token):
     github_request("PUT", token, payload)
 
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_history(symbol, period="1y", interval="1d"):
+    return yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_info(symbol):
+    try:
+        return yf.Ticker(symbol).get_info() or {}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_news(symbol):
+    try:
+        return yf.Ticker(symbol).news or []
+    except Exception:
+        return []
+
+
+def numeric(value):
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def formatted(value, style="number"):
+    number = numeric(value)
+    if number is None:
+        return "—"
+    if style == "money":
+        return f"$" + f"{number:,.2f}"
+    if style == "cap":
+        for divisor, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+            if abs(number) >= divisor:
+                return f"$" + f"{number / divisor:,.2f}{suffix}"
+        return f"$" + f"{number:,.0f}"
+    if style == "percent":
+        return f"{number:+.2f}%"
+    return f"{number:,.2f}"
+
+
+def rsi14(closes):
+    if len(closes) < 15:
+        return None
+    change = closes.diff()
+    gain = change.clip(lower=0).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean().iloc[-1]
+    loss = (-change.clip(upper=0)).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean().iloc[-1]
+    if pd.isna(gain) or pd.isna(loss):
+        return None
+    if loss == 0:
+        return 100.0 if gain > 0 else 50.0
+    return 100 - 100 / (1 + gain / loss)
+
+
+def range_history(closes, selected):
+    months = {"1M": 1, "6M": 6, "1Y": 12}[selected]
+    cutoff = closes.index.max() - pd.DateOffset(months=months)
+    result = closes.loc[closes.index >= cutoff]
+    return result if not result.empty else closes
+
+
+def news_items(symbol):
+    items = []
+    for item in cached_news(symbol):
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        data = content if isinstance(content, dict) else item
+        title = data.get("title")
+        provider = data.get("provider")
+        publisher = (provider.get("displayName") if isinstance(provider, dict) else None) or data.get("publisher") or "Unknown publisher"
+        link = data.get("link")
+        for key in ("canonicalUrl", "clickThroughUrl"):
+            candidate = data.get(key)
+            if not link and isinstance(candidate, dict):
+                link = candidate.get("url")
+        if title and isinstance(link, str) and link.startswith(("https://", "http://")):
+            items.append((str(title), str(publisher), link))
+        if len(items) == 3:
+            break
+    return items
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def stock_data(symbol):
     ticker = yf.Ticker(symbol)
-    daily = ticker.history(period="1mo", interval="1d", auto_adjust=False)
+    daily = cached_history(symbol, period="1y")
     if daily.empty or "Close" not in daily:
         raise ValueError("No market data available")
     closes = daily["Close"].dropna()
     if closes.empty:
         raise ValueError("No closing prices available")
 
-    latest = ticker.history(period="1d", interval="5m", auto_adjust=False)
+    latest = cached_history(symbol, period="1d", interval="5m")
     if not latest.empty and "Close" in latest and not latest["Close"].dropna().empty:
         price = float(latest["Close"].dropna().iloc[-1])
         previous_close = float(closes.iloc[-2]) if len(closes) > 1 else None
@@ -135,13 +225,13 @@ def stock_data(symbol):
 
     name = symbol
     try:
-        info = ticker.get_info()
+        info = cached_info(symbol)
         name = info.get("shortName") or info.get("longName") or symbol
     except Exception:
         pass
     change = price - previous_close if previous_close else None
     change_pct = 100 * change / previous_close if previous_close else None
-    return name, price, change, change_pct, closes.reset_index(drop=True)
+    return name, price, change, change_pct, closes
 
 
 def change_label(amount, percentage):
@@ -170,6 +260,9 @@ header_left, header_right = st.columns([3, 1], vertical_alignment="center")
 with header_right:
     if st.button("↻ Refresh", use_container_width=True):
         stock_data.clear()
+        cached_history.clear()
+        cached_info.clear()
+        cached_news.clear()
         if can_save:
             try:
                 latest_list, _ = read_github(token)
